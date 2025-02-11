@@ -18,7 +18,7 @@ interface KeyValue {
     [key:string]: string
 }
 
-export default class {
+export default class HareDB {
 
     private kv: KeyValue
     private db: Database

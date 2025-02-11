@@ -61,11 +61,10 @@ export default class HareDB {
         // cleanup, unlock and zero out standard buffer since we're done with it
         sodium_munlock(unsafeSk)
 
-        // close process if unable to secure memory for the secret key
+        // close process to close if unable to secure memory for the secret key
         if (!this.sk.secure) {
             console.error('Failed to secure memory for secret key. HareDB cannot run securely. Shutting down...')
-            sodium_mprotect_readwrite(this.sk) // allow read/write to secret key
-            sodium_munlock(this.sk) // unlock secret key and memzero it
+            this.close()
             process.exit(1) // shutdown
         }
     }
@@ -109,7 +108,6 @@ export default class HareDB {
         // set in memory
         this.kv[key] = value
 
-        // TODO: move to worker
         this.db.query(`INSERT OR REPLACE INTO key_value (key, value) VALUES ($key, $value);`)
         .run({$key: key, $value: value})
     }
@@ -123,7 +121,9 @@ export default class HareDB {
     }
 
     public close(): void {
-        return this.db.close()
+        sodium_mprotect_readwrite(this.sk) // allow read/write to secret key
+        sodium_munlock(this.sk) // unlock secret key and memzero it
+        this.db.close()
     }
 
 }

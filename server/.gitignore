@@ -177,3 +177,5 @@ dist
 # database files
 *.sqlite
 *.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal

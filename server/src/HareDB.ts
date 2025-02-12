@@ -25,8 +25,15 @@ export default class HareDB {
     private sk: SecureBuffer
 
     constructor(dbPath: string, secretKey: string) {
+
+        // in memory key value store
         this.kv = {}
+
+        // sqlite persistent database
         this.db = new Database(dbPath, { create: true });
+        this.db.exec("PRAGMA journal_mode = WAL;");
+
+        // store as text because Bun weirdly sometimes maps BLOBs to Buffers, and other times to Uint8Arrays unpredictably
         this.db.exec(`
             CREATE TABLE IF NOT EXISTS key_value(
                 key TEXT NOT NULL PRIMARY KEY,
@@ -104,20 +111,32 @@ export default class HareDB {
     public set(key: string, value: string): void {
         key = this.encrypt(key)
         value = this.encrypt(value)
-
-        // set in memory
         this.kv[key] = value
-
-        this.db.query(`INSERT OR REPLACE INTO key_value (key, value) VALUES ($key, $value);`)
-        .run({$key: key, $value: value})
+        this.db.query(`INSERT OR REPLACE INTO key_value (key, value) VALUES (?, ?);`).run(key, value)
     }
 
     public get(key: string): string | null {
-        const kv: string | undefined = this.kv[this.encrypt(key)]
-        if (typeof kv !== 'undefined') {
-            return this.decrypt(kv)
+        key = this.encrypt(key) // both keys and values are stored in memory and at rest encrypted
+        const fromKv: string | undefined = this.kv[key] // search memory for key value pair
+        if (fromKv) {
+            return this.decrypt(fromKv)
         }
-        return null
+        // it may be in the database even if it's not in memory if multiple local instances of HareDB are running
+        const fromDb = this.db.query(`SELECT value FROM key_value WHERE key = ?`).get(key) as { value: string } | null
+        if (fromDb) {
+            this.kv[key] = fromDb.value // put it in memory for future get calls
+            return this.decrypt(fromDb.value)
+        }
+        return null // non existent
+    }
+
+    public del(key: string): boolean {
+        key = this.encrypt(key)
+        const inMemory: boolean = typeof this.kv[key] !== 'undefined'
+        if (inMemory) {
+            delete this.kv[key]
+        }
+        return inMemory || this.db.query(`DELETE FROM key_value WHERE key = ?`).run(key).changes > 0
     }
 
     public close(): void {

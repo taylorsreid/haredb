@@ -117,15 +117,8 @@ export default class HareDB {
 
     public get(key: string): string | null {
         key = this.encrypt(key) // both keys and values are stored in memory and at rest encrypted
-        const fromKv: string | undefined = this.kv[key] // search memory for key value pair
-        if (fromKv) {
-            return this.decrypt(fromKv)
-        }
-        // it may be in the database even if it's not in memory if multiple local instances of HareDB are running
-        const fromDb = this.db.query(`SELECT value FROM key_value WHERE key = ?`).get(key) as { value: string } | null
-        if (fromDb) {
-            this.kv[key] = fromDb.value // put it in memory for future get calls
-            return this.decrypt(fromDb.value)
+        if (this.kv[key]) {
+            return this.decrypt(this.kv[key])
         }
         return null // non existent
     }

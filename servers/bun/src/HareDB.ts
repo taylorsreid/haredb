@@ -1,4 +1,5 @@
-import { Database } from "bun:sqlite";
+import { Database, constants } from "bun:sqlite";
+import fs from "node:fs";
 import {
     crypto_secretbox_easy,
     crypto_secretbox_KEYBYTES,
@@ -14,11 +15,15 @@ import {
     type SecureBuffer
 } from "sodium-native";
 
+interface KeyValue {
+    [key: string]: string
+}
+
 export default class HareDB {
 
-    private kv: {
-        [key:string]: string
-    }
+    private dbPath: string
+
+    private kv: KeyValue
 
     private worker: Worker
 
@@ -46,68 +51,73 @@ export default class HareDB {
         })
 
         if (secretKey) {
-            // create secret key standard buffer
-            const unsafeSk: Buffer = Buffer.from(secretKey)
-            sodium_mlock(unsafeSk) // keep out of swap
 
-            // create secret key secured buffer
-            this.sk = sodium_malloc(crypto_secretbox_KEYBYTES)
+            const unsafeSk: Buffer = Buffer.from(secretKey) // create secret key standard buffer
+            sodium_mlock(unsafeSk) // keep out of swap
+            Bun.gc(true) // collect garbage to remove unecrypted secretKey string
+            this.sk = sodium_malloc(crypto_secretbox_KEYBYTES) // create secret key secured buffer
             sodium_mlock(this.sk) // keep secret key out of swap
             this.sk.set(unsafeSk)
             sodium_mprotect_noaccess(this.sk) // revoke all access to secret key unless specifically enabled
-
-            // cleanup, unlock and zero out standard buffer since we're done with it
-            sodium_munlock(unsafeSk)
-
-            this.secure = true
-
-            // TODO: fix
-            // close process to close if unable to secure memory for the secret key
-            if (!this.sk.secure) {
-                console.error('Failed to secure memory for secret key. HareDB cannot run securely. Shutting down...')
+            sodium_munlock(unsafeSk) // cleanup, unlock and zero out standard buffer since we're done with it
+            if (!this.sk.secure) { // force close if unable to secure memory for the secret key
                 this.close()
-                process.exit(1) // shutdown
+                throw new Error('Failed to secure memory for secret key. HareDB cannot run securely. Shutting down...')
+            }
+            Bun.unsafe.gcAggressionLevel(1) // TODO: TEST PERFORMANCE IMPACT
+            this.secure = true
+        }
+        else {
+            this.secure = false
+        }
+
+        this.kv = {} // in memory key value store
+        this.dbPath = dbPath
+
+        // create persistent database and set up schema
+        // store kv's as text because Bun weirdly sometimes maps BLOBs to Buffers, and other times to Uint8Arrays unpredictably
+        const db: Database = new Database(dbPath, { create: true, strict: true, });
+        db.fileControl(constants.SQLITE_FCNTL_PERSIST_WAL, 0);
+        db.exec(`
+            PRAGMA journal_mode = WAL;
+            CREATE TABLE IF NOT EXISTS key_value (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS meta (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL);
+        `)
+        db.prepare(`
+            INSERT OR IGNORE INTO meta (key, value) VALUES
+            ('create_language', 'ts_bun'), ('version', :version), ('secure', :secure), ('create_time', :now);
+        `)
+            .run({
+                version: Bun.env.npm_package_version ?? '0.0.0',
+                secure: `${this.secure}`,
+                now: `${Math.round(Date.now() / 1000)}`
+            })
+
+        // check for security settings mismatch
+        if (this.secure !== ((db.prepare(`SELECT value FROM meta WHERE key = 'secure';`).get() as { value: string }).value === 'true')) {
+            throw new Error(this.secure ?
+                `Configuration error, an encryption key was provided in the constructor, but the persistence file '${dbPath}' is not set to use encryption. For security purposes, these two must match. Consider creating a new database file to use encryption, or omit the secretKey argument in the constructor to use the existing unencrypted database.`
+                : `Configuration error, an encryption key was not provided in the constructor, and the persistence file ${dbPath} is set to use encryption. Provide the encryption key to decrypt and use this database.`
+            )
+        }
+
+        if (this.secure) {
+            db.prepare(`INSERT OR IGNORE INTO meta (key, value) VALUES ('secure_test_string', ?);`).run(this.encrypt('ENCRYPTED TEXT'))
+            try {
+                this.decrypt((db.prepare(`SELECT value FROM meta WHERE key = 'secure_test_string';`).get() as {value: string}).value) // throws on failure
+            } catch (error) {
+                throw new Error('Decryption error, the provided encryption key is not correct.')
             }
         }
 
-        // in memory key value store
-        this.kv = {}
-
-        // sqlite persistent database
-        const db: Database = new Database(dbPath, { create: true });
-        db.exec("PRAGMA journal_mode = WAL;");
-
-        // TODO: add config table with secure option
-        db.exec(`
-            CREATE TABLE IF NOT EXISTS config(
-                key TEXT NOT NULL PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-        `)
-
-        // store as text because Bun weirdly sometimes maps BLOBs to Buffers, and other times to Uint8Arrays unpredictably
-        db.exec(`
-            CREATE TABLE IF NOT EXISTS key_value(
-                key TEXT NOT NULL PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-        `)
-        db.query(`SELECT * FROM key_value;`).all().map((result) => {
-            // all this just to make typescript play nice
-            if (
-                typeof result === 'object'
-                && result !== null
-                && 'key' in result
-                && typeof result.key === 'string'
-                && 'value' in result
-                && typeof result.value === 'string'
-            ) {
-                this.kv[result.key] = result.value
-                // result.key and result.value are already encrypted, so no need to lock memory or memzero anything here
-            }
+        // load all keys in persistent storage into memory
+        db.prepare(`SELECT * FROM key_value;`).all().map((result) => {
+            // result.key and result.value are already encrypted, so no need to lock memory or memzero anything here
+            this.kv[(result as KeyValue).key] = (result as KeyValue).value
         })
-
-        db.close()
+        
+        // close local db now that synchronous startup work is complete and offload all further work to a worker thread
+        db.close(false)
         this.worker = new Worker('./src/dbworker.ts')
         this.worker.postMessage({
             action: 'STARTUP',
@@ -126,11 +136,9 @@ export default class HareDB {
 
         // briefly allow secret key access, encrypt, then revoke secret key access again
         sodium_mprotect_readonly(this.sk)
-        crypto_secretbox_easy(encryptedBuffer, unencryptedBuffer, nonce, this.sk)
+        crypto_secretbox_easy(encryptedBuffer, unencryptedBuffer, nonce, this.sk) // encryptedBuffer is mutated in place
         sodium_mprotect_noaccess(this.sk)
-
-        // unlock and memzero the unencrypted buffer
-        sodium_munlock(unencryptedBuffer)
+        sodium_munlock(unencryptedBuffer) // unlock and memzero the unencrypted buffer
 
         return JSON.stringify(Array.from(encryptedBuffer))
     }
@@ -147,6 +155,22 @@ export default class HareDB {
         throw new Error('Unable to decrypt a value, has the encryption key changed?')
     }
 
+    // TODO: FIGURE THIS OUT, FIX RACE CONDITIONS
+    public changeKey(newKey: string): HareDB {
+        // console.log('CHANGE KEY CALLED')
+        if (!this.secure) {
+            throw new Error('not in secure mode')
+        }
+        Bun.file(this.dbPath).delete()
+        const newHdb: HareDB = new HareDB(this.dbPath, newKey)
+        for (const [key, value] of Object.entries(this.kv)) {
+            newHdb.set(this.decrypt(key), this.decrypt(value))
+        }
+        this.close() // automatically calls gc
+        return newHdb
+    }
+
+    // TODO: RACE CONDITION BUG
     /**
      * Set a key value pair to be stored in memory and persisted on disk.
      * Persistent file system operations happen in a separate worker thread and are non-blocking.
@@ -154,7 +178,10 @@ export default class HareDB {
      * @param value the string value assigned to the key.
      * @returns true if an existing key/value pair was updated, false if it was newly created.
      */
-    public set(key: string, value: string): boolean {
+    public set(key: string, value: string): {
+        exists: boolean,
+        done: Promise<void>
+    } {
         if (this.secure) {
             key = this.encrypt(key)
             value = this.encrypt(value)
@@ -163,10 +190,24 @@ export default class HareDB {
         this.kv[key] = value
         this.worker.postMessage({
             action: 'SET',
-            key: key,
-            value: value
+            key,
+            value
         })
-        return exists
+        return {
+            exists,
+            done: new Promise((resolve) => {
+                // console.log('promise invoked')
+                const handler = (event: MessageEvent) => {
+                    console.log(event.data)
+                    // console.log(`event.data.key: ${event.data.key}`)
+                    if (event.data.key === key && event.data.action === 'SET_DONE') {
+                        resolve()
+                        this.worker.removeEventListener('message', handler)
+                    }
+                }
+                this.worker.onmessage = handler
+            })
+        }
     }
 
     /**
@@ -199,25 +240,47 @@ export default class HareDB {
      * @param key the string "name" that the value is stored under.
      * @returns true if the key/value pair existed in memory, false if not.
      */
-    public del(key: string): boolean {
+    public del(key: string): {
+        exists: boolean,
+        done: Promise<void>
+    } {
         if (this.secure) {
             key = this.encrypt(key)
         }
-        const inMemory: boolean = key in this.kv
-        if (inMemory) {
+        const exists: boolean = key in this.kv
+        if (exists) {
             delete this.kv[key]
             this.worker.postMessage({
                 action: 'DEL',
                 key: key
             })
         }
-        return inMemory
+        return {
+            exists,
+            done: new Promise((resolve) => {
+                const handler = (event: MessageEvent) => {
+                    if (event.data.key === key && event.data.action === 'DEL_DONE') {
+                        resolve()
+                        this.worker.removeEventListener('message', handler)
+                    }
+                }
+                this.worker.onmessage = handler
+            })
+        }
     }
 
+    /**
+     * 
+     */
     public close(): void {
-        this.worker.postMessage({ action: 'SHUTDOWN' })
-        sodium_mprotect_readwrite(this.sk) // allow read/write to secret key
-        sodium_munlock(this.sk) // unlock secret key and memzero it
+        if (this.worker) { // undefined if decryption of test string fails in the constructor
+            this.worker.postMessage({ action: 'SHUTDOWN' })
+        }
+        if (this.secure) {
+            sodium_mprotect_readwrite(this.sk) // allow read/write to secret key
+            sodium_munlock(this.sk) // unlock secret key and memzero it
+            Bun.gc(true) // force garbage collection just in case
+        }
     }
 
 }

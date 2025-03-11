@@ -1,7 +1,7 @@
 import Elysia, { error, redirect, t } from "elysia";
 import HareDB from "./HareDB";
 
-export { default } from './HareDB';
+// export { default } from './HareDB';
 
 if (typeof Bun.env.HAREDB_SECRET_KEY === 'undefined') {
     throw new Error(`No HAREDB_SECRET_KEY environment variable is set. Please set it to continue.`);

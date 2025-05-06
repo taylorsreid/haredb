@@ -179,3 +179,6 @@ dist
 *.sqlite-journal
 *.sqlite-shm
 *.sqlite-wal
+
+# scratch file
+scratch.ts

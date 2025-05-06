@@ -1,5 +1,4 @@
 import { Database, constants } from "bun:sqlite";
-import fs from "node:fs";
 import {
     crypto_secretbox_easy,
     crypto_secretbox_KEYBYTES,
@@ -20,8 +19,6 @@ interface KeyValue {
 }
 
 export default class HareDB {
-
-    private dbPath: string
 
     private kv: KeyValue
 
@@ -51,7 +48,6 @@ export default class HareDB {
         })
 
         if (secretKey) {
-
             const unsafeSk: Buffer = Buffer.from(secretKey) // create secret key standard buffer
             sodium_mlock(unsafeSk) // keep out of swap
             Bun.gc(true) // collect garbage to remove unecrypted secretKey string
@@ -72,7 +68,6 @@ export default class HareDB {
         }
 
         this.kv = {} // in memory key value store
-        this.dbPath = dbPath
 
         // create persistent database and set up schema
         // store kv's as text because Bun weirdly sometimes maps BLOBs to Buffers, and other times to Uint8Arrays unpredictably
@@ -155,22 +150,21 @@ export default class HareDB {
         throw new Error('Unable to decrypt a value, has the encryption key changed?')
     }
 
-    // TODO: FIGURE THIS OUT, FIX RACE CONDITIONS
-    public changeKey(newKey: string): HareDB {
-        // console.log('CHANGE KEY CALLED')
-        if (!this.secure) {
-            throw new Error('not in secure mode')
-        }
-        Bun.file(this.dbPath).delete()
-        const newHdb: HareDB = new HareDB(this.dbPath, newKey)
-        for (const [key, value] of Object.entries(this.kv)) {
-            newHdb.set(this.decrypt(key), this.decrypt(value))
-        }
-        this.close() // automatically calls gc
-        return newHdb
-    }
+    // TODO: MOVE THIS TO CLI TOOL, TOO MANY POTENTIAL RACE CONDITIONS
+    // public changeKey(newKey: string): HareDB {
+    //     // console.log('CHANGE KEY CALLED')
+    //     if (!this.secure) {
+    //         throw new Error('not in secure mode')
+    //     }
+    //     Bun.file(this.dbPath).delete()
+    //     const newHdb: HareDB = new HareDB(this.dbPath, newKey)
+    //     for (const [key, value] of Object.entries(this.kv)) {
+    //         newHdb.set(this.decrypt(key), this.decrypt(value))
+    //     }
+    //     this.close() // automatically calls gc
+    //     return newHdb
+    // }
 
-    // TODO: RACE CONDITION BUG
     /**
      * Set a key value pair to be stored in memory and persisted on disk.
      * Persistent file system operations happen in a separate worker thread and are non-blocking.
@@ -178,10 +172,7 @@ export default class HareDB {
      * @param value the string value assigned to the key.
      * @returns true if an existing key/value pair was updated, false if it was newly created.
      */
-    public set(key: string, value: string): {
-        exists: boolean,
-        done: Promise<void>
-    } {
+    public set(key: string, value: string): boolean {
         if (this.secure) {
             key = this.encrypt(key)
             value = this.encrypt(value)
@@ -190,24 +181,10 @@ export default class HareDB {
         this.kv[key] = value
         this.worker.postMessage({
             action: 'SET',
-            key,
-            value
+            key: key,
+            value: value
         })
-        return {
-            exists,
-            done: new Promise((resolve) => {
-                // console.log('promise invoked')
-                const handler = (event: MessageEvent) => {
-                    console.log(event.data)
-                    // console.log(`event.data.key: ${event.data.key}`)
-                    if (event.data.key === key && event.data.action === 'SET_DONE') {
-                        resolve()
-                        this.worker.removeEventListener('message', handler)
-                    }
-                }
-                this.worker.onmessage = handler
-            })
-        }
+        return exists
     }
 
     /**
@@ -240,10 +217,7 @@ export default class HareDB {
      * @param key the string "name" that the value is stored under.
      * @returns true if the key/value pair existed in memory, false if not.
      */
-    public del(key: string): {
-        exists: boolean,
-        done: Promise<void>
-    } {
+    public del(key: string): boolean {
         if (this.secure) {
             key = this.encrypt(key)
         }
@@ -255,18 +229,7 @@ export default class HareDB {
                 key: key
             })
         }
-        return {
-            exists,
-            done: new Promise((resolve) => {
-                const handler = (event: MessageEvent) => {
-                    if (event.data.key === key && event.data.action === 'DEL_DONE') {
-                        resolve()
-                        this.worker.removeEventListener('message', handler)
-                    }
-                }
-                this.worker.onmessage = handler
-            })
-        }
+        return exists
     }
 
     /**
